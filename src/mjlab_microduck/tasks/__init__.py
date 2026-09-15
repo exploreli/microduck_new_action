@@ -75,6 +75,10 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_backflip_env_cfg import (
+    make_microduck_backflip_env_cfg,
+    MicroduckBackflipRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -230,6 +234,17 @@ register_mjlab_task(
     env_cfg=make_microduck_roulade_env_cfg(),
     play_env_cfg=make_microduck_roulade_env_cfg(play=True),
     rl_cfg=MicroduckRouladeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Backflip — backward AERIAL flip (jump, tuck, rotate 2π in free flight), land
+# back on the feet. Sibling of the roulade; the rotation accumulator is
+# airborne-gated (contact-inverted) instead of support-gated.
+register_mjlab_task(
+    task_id="Mjlab-Backflip-Flat-MicroDuck",
+    env_cfg=make_microduck_backflip_env_cfg(),
+    play_env_cfg=make_microduck_backflip_env_cfg(play=True),
+    rl_cfg=MicroduckBackflipRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

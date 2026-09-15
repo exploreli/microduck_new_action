@@ -7186,3 +7186,482 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ==============================================================================
+# Backflip (backward aerial flip) task — episodic dynamic maneuver
+# ==============================================================================
+#
+# Sibling of the roulade, with the ONE physical difference that reshapes the
+# whole design: a roulade is a SUPPORTED roll (it never leaves the floor, so its
+# rotation accumulator is contact-GATED), a backflip is an AERIAL flip (the
+# rotation happens in free flight, so the accumulator is contact-INVERTED — it
+# only integrates while the robot is AIRBORNE). Everything else reuses the
+# proven roulade/standup episodic recipe:
+#   • ONE dense progress signal — paid INCREMENTS of the max-so-far cumulative
+#     BACKWARD rotation (potential-based: a full 2π flip pays 2π worth total,
+#     camping/rocking pays zero per step, spinning past 2π is clamped).
+#   • Landing rewards (composite product, upright, height, sharp, stand-tax)
+#     gated on FLIP COMPLETION (rotation frontier ≥ ~300°) AND on an AIRBORNE
+#     LATCH — state-based gates, not a clock. "Do nothing" earns nothing; a
+#     standing spawn cannot farm the annuity; only jumping AND flipping opens it.
+#   • Reverse curriculum via MID-AIR spawns (the roulade mid-roll trick that
+#     fixed the last mile): a slice of episodes starts already airborne, tucked,
+#     pitched 120°–330° into the flip with backward angular momentum, and the
+#     accumulator pre-set to the spawn angle. The second half of a backflip
+#     (untuck → spot the floor → land) is where every run either lands or
+#     face-plants, so it gets dense on-policy data from iteration 0.
+#
+# WHY THE AIRBORNE GATE (the anti-cheat, learned from the roulade run-1
+# "breakdance whip"): with rotation counted regardless of contact, the cheapest
+# 2π is a violent backward rock/roll on the ground — same rotation, no jump, no
+# risk. Gating the accumulator on NO-ground-contact makes a ground roll earn
+# nothing: the ONLY way to accumulate flip progress is to actually leave the
+# floor and spin in the air, which is the maneuver we asked for. The airborne
+# latch additionally requires free flight to have happened before the landing
+# annuity unlocks, so a hop-in-place that never rotates cannot collect it.
+#
+# DIRECTION: forward roll = +ω_y (roulade); a BACKflip pitches the nose UP and
+# over backward = NEGATIVE body-frame ω_y, so _BACKFLIP_ROT_SIGN = -1 and the
+# accumulator integrates -ω_y. Mid-air spawns are pitched by -θ about body y.
+#
+# SPEED: a 25 cm robot must complete 2π in roughly its airtime (~0.4 s), i.e.
+# ~12–16 rad/s of pitch — FAST by design (AGENTS.md: don't impose human-scale
+# speed caps on a small tumbler). The paid-rate cap and the overspeed penalty
+# are therefore set well ABOVE that natural rate so they tax only absurd whips,
+# never the physically-necessary rotation (the roulade run-3 lesson: a cap below
+# the natural transit speed forfeits the maneuver itself).
+#
+# IMPACT: unlike the roulade, there is NO ungated |a_z| penalty — the takeoff IS
+# a large +a_z explosion and the landing a large -a_z, so trunk_vertical_accel_
+# penalty would tax the very mechanism the flip needs (the same "don't tax
+# attempts during discovery" family). Post-landing settle is shaped instead by
+# the height-gated arrival damper (body_ang_vel_at_height), introduced late.
+#
+# Per-env state on the env object (created lazily, reset by
+# reset_backflip_state):
+#   env._backflip_accum           — airborne-only integral of backward pitch rate (rad)
+#   env._backflip_max             — max(accum) so far this episode (progress frontier)
+#   env._backflip_paid            — frontier already paid out by backflip_progress
+#   env._backflip_airborne_latch  — True once the robot left the ground this episode
+
+# Backward-flip sign: a backflip pitches nose-up/over-backward = NEGATIVE
+# body-frame ω_y (forward roll is +ω_y; see the roulade sign note above).
+_BACKFLIP_ROT_SIGN = -1.0
+
+# Sensor read for the airborne gate: airborne = NO robot geom touches terrain.
+# NAME IS LOAD-BEARING — must match the env cfg's whole-robot contact sensor.
+_BACKFLIP_AIR_SENSOR = "robot_ground_contact"
+
+
+def _backflip_state(env: ManagerBasedRlEnv) -> tuple:
+    """Lazily create and return the per-env backflip accumulator state."""
+    if not hasattr(env, "_backflip_accum"):
+        z = torch.zeros(env.num_envs, device=env.device)
+        env._backflip_accum = z.clone()
+        env._backflip_max = z.clone()
+        env._backflip_paid = z.clone()
+        env._backflip_airborne_latch = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+        env._backflip_last_update_step = -1
+    return env._backflip_accum, env._backflip_max, env._backflip_paid
+
+
+def _backflip_airborne(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-env bool: True where the robot is in free flight (no ground contact).
+
+    Falls back to all-True if the support sensor is absent so the term degrades
+    gracefully (the env cfg always registers it).
+    """
+    contact = _sensor_any_contact(env, _BACKFLIP_AIR_SENSOR)
+    if contact is None:
+        return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    return ~contact
+
+
+def _update_backflip_accum(env: ManagerBasedRlEnv, asset: Entity) -> None:
+    """Integrate BACKWARD pitch rate into the per-env rotation accumulator.
+
+    Step-guarded so multiple reward terms reading the accumulator in the same
+    control step don't double-integrate. The frontier (max) only moves forward;
+    a wind-up rock neither pays nor un-pays.
+
+    AIRBORNE GATE (the anti-cheat): rotation is integrated only while NO robot
+    geom touches the terrain — a genuine backflip spins in free flight, so a
+    backward ground roll accumulates nothing and never opens the landing gate.
+    The sagittal flatness gate (shared with the roulade) zeroes credit for a
+    sideways/shoulder cartwheel: only a clean pitch-plane flip counts.
+
+    Also latches env._backflip_airborne_latch the first step the robot is off
+    the ground — the landing annuity requires it, so a hop that never achieves
+    free flight cannot collect the standing reward.
+    """
+    _backflip_state(env)
+    step = int(env.common_step_counter)
+    if step != env._backflip_last_update_step:
+        airborne = _backflip_airborne(env)
+        omega_bf = _BACKFLIP_ROT_SIGN * asset.data.root_link_ang_vel_b[:, 1]
+        delta = torch.nan_to_num(omega_bf, nan=0.0) * env.step_dt * airborne.float()
+        # Sagittal flatness gate (shared with the roulade): a side flip that
+        # tips the lateral axis off horizontal earns reduced/zero rotation.
+        y_z = torch.nan_to_num(_lateral_axis_z(asset.data.root_link_quat_w), nan=1.0).abs()
+        t = torch.clamp((_FLAT_ZERO - y_z) / (_FLAT_ZERO - _FLAT_FULL), 0.0, 1.0)
+        delta = delta * (t * t * (3.0 - 2.0 * t))
+        env._backflip_accum = env._backflip_accum + delta
+        env._backflip_max = torch.maximum(env._backflip_max, env._backflip_accum)
+        env._backflip_airborne_latch = env._backflip_airborne_latch | airborne
+        env._backflip_last_update_step = step
+
+
+def _backflip_completion_gate(
+    env: ManagerBasedRlEnv,
+    gate_lo: float,
+    gate_hi: float,
+    require_airborne: bool = True,
+) -> torch.Tensor:
+    """Smoothstep on the progress frontier: 0 below gate_lo rad, 1 above gate_hi.
+
+    State-based replacement for a phase clock — it can only be opened by
+    actually rotating WHILE AIRBORNE (the accumulator is contact-inverted), so
+    neither pre-flip standing nor a backward ground roll collects. With
+    require_airborne=True the gate additionally requires the airborne latch:
+    the episode must have left the floor to unlock the landing annuity.
+    """
+    _, max_accum, _ = _backflip_state(env)
+    t = torch.clamp((max_accum - gate_lo) / max(gate_hi - gate_lo, 1e-6), 0.0, 1.0)
+    gate = t * t * (3.0 - 2.0 * t)
+    if require_airborne:
+        gate = gate * env._backflip_airborne_latch.float()
+    return gate
+
+
+def reset_backflip_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    standing_prob: float = 0.5,
+    air_prob: float = 0.5,
+    standing_z_min: float = 0.11,
+    standing_z_max: float = 0.12,
+    standing_tilt_max: float = 0.0,
+    air_pitch_min: float = math.radians(120.0),
+    air_pitch_max: float = math.radians(330.0),
+    air_z_min: float = 0.13,
+    air_z_max: float = 0.19,
+    air_omega_range: tuple = (4.0, 9.0),
+    air_vz_range: tuple = (-0.2, 0.4),
+    tuck_overrides: Optional[dict] = None,
+    tuck_factor_range: tuple = (0.4, 1.0),
+    joint_noise_std: float = 0.0,
+):
+    """Reset to a standing start or a MID-AIR state (reverse curriculum).
+
+    Standing bucket: upright (±standing_tilt_max pitch/roll noise), random yaw,
+    HOME joints (left from reset_robot_joints), z in [standing_z_min, _max],
+    zero root velocity — the policy must discover the crouch-jump-flip-land
+    chain itself (the launch/progress rewards bootstrap it).
+
+    Mid-air bucket: spawned in FREE FLIGHT pitched ``air_pitch_min..max`` into
+    the BACKWARD flip (θ about body y applied as -θ), random yaw, legs lerped
+    HOME→tuck by a per-env factor in ``tuck_factor_range``, z in
+    [air_z_min, air_z_max] (above standing so it is genuinely airborne),
+    backward angular momentum -ω_y from ``air_omega_range`` and an optional
+    vertical velocity from ``air_vz_range`` (hang time). The accumulator is
+    initialized to the spawn angle θ so progress accounting and the completion
+    gate stay consistent: a 300° spawn is only paid for the remaining ~60°.
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    num = len(env_ids)
+    asset: Entity = env.scene[asset_cfg.name]
+    accum, max_accum, paid = _backflip_state(env)
+
+    total = standing_prob + air_prob
+    is_air = torch.rand(num, device=env.device) < (air_prob / max(total, 1e-6))
+
+    yaw = torch.rand(num, device=env.device) * 2 * np.pi - np.pi
+    cy = torch.cos(yaw * 0.5)
+    sy = torch.sin(yaw * 0.5)
+
+    # Backward rotation angle θ ≥ 0; the euler PITCH is -θ (nose up/back).
+    theta = (
+        torch.rand(num, device=env.device) * (air_pitch_max - air_pitch_min)
+        + air_pitch_min
+    )
+    pitch_noise = (torch.rand(num, device=env.device) * 2 - 1) * standing_tilt_max
+    pitch = torch.where(is_air, -theta, pitch_noise)
+    roll = (torch.rand(num, device=env.device) * 2 - 1) * max(
+        standing_tilt_max, math.radians(5.0)
+    )
+
+    cp = torch.cos(pitch * 0.5); sp = torch.sin(pitch * 0.5)
+    cr = torch.cos(roll * 0.5); sr = torch.sin(roll * 0.5)
+    # ZYX intrinsic Euler → quaternion (yaw * pitch * roll), as in
+    # set_random_ground_state / reset_roulade_state.
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    quat = torch.stack([qw, qx, qy, qz], dim=1)
+
+    z_stand = torch.rand(num, device=env.device) * (standing_z_max - standing_z_min) + standing_z_min
+    z_air = torch.rand(num, device=env.device) * (air_z_max - air_z_min) + air_z_min
+    new_z = torch.where(is_air, z_air, z_stand)
+
+    env.sim.data.qpos[env_ids, 2] = new_z
+    env.sim.data.qpos[env_ids, 3:7] = quat
+    env.sim.data.qvel[env_ids, :6] = 0.0
+
+    servo_ids = _servo_joint_ids(env, asset)
+
+    # Mid-air joints: lerp HOME → tuck on the overridden joints, noise on all
+    # servo joints (passive_* backlash hinges must stay at 0).
+    air_env_ids = env_ids[is_air]
+    if len(air_env_ids) > 0 and tuck_overrides:
+        u = (
+            torch.rand(len(air_env_ids), device=env.device)
+            * (tuck_factor_range[1] - tuck_factor_range[0])
+            + tuck_factor_range[0]
+        )
+        for jnt_idx, angle in tuck_overrides.items():
+            col = 7 + servo_ids[jnt_idx]
+            home = env.sim.data.qpos[air_env_ids, col]
+            env.sim.data.qpos[air_env_ids, col] = home + u * (angle - home)
+    if len(air_env_ids) > 0 and joint_noise_std > 0.0:
+        cols = torch.tensor([7 + j for j in servo_ids], device=env.device, dtype=torch.long)
+        noise = torch.randn(len(air_env_ids), len(cols), device=env.device) * joint_noise_std
+        env.sim.data.qpos[air_env_ids.unsqueeze(1), cols.unsqueeze(0)] += noise
+
+    # Mid-air backward angular momentum: rotation about body -y. MuJoCo free
+    # joint qvel[3:6] is the angular velocity in the BODY frame, so qvel[4] is
+    # ω_y regardless of spawn yaw; _BACKFLIP_ROT_SIGN=-1 makes it backward.
+    if len(air_env_ids) > 0 and air_omega_range[1] > 0.0:
+        omega = (
+            torch.rand(len(air_env_ids), device=env.device)
+            * (air_omega_range[1] - air_omega_range[0])
+            + air_omega_range[0]
+        )
+        env.sim.data.qvel[air_env_ids, 4] = _BACKFLIP_ROT_SIGN * omega
+    # Optional vertical velocity (hang time): world-frame z, qvel[2].
+    if len(air_env_ids) > 0 and air_vz_range[1] != air_vz_range[0]:
+        vz = (
+            torch.rand(len(air_env_ids), device=env.device)
+            * (air_vz_range[1] - air_vz_range[0])
+            + air_vz_range[0]
+        )
+        env.sim.data.qvel[air_env_ids, 2] = vz
+
+    # Progress accounting: standing starts at 0, mid-air at the spawn angle θ.
+    spawn_angle = torch.where(is_air, theta, torch.zeros_like(theta))
+    accum[env_ids] = spawn_angle
+    max_accum[env_ids] = spawn_angle
+    paid[env_ids] = spawn_angle
+    # Airborne latch: mid-air spawns are born in free flight (already latched);
+    # standing spawns must earn it by actually leaving the ground.
+    env._backflip_airborne_latch[env_ids] = is_air
+
+
+def backflip_progress(
+    env: ManagerBasedRlEnv,
+    target_angle: float = 2 * math.pi,
+    max_paid_rate: float = 18.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay increments of the airborne backward-rotation frontier, up to 2π.
+
+    reward = Δ(min(max_accum, target)) / (step_dt · target), CAPPED at
+    max_paid_rate rad/s of paid rotation. Nothing to farm by camping upright
+    (0/step), rocking below the frontier (0/step), rolling backward on the
+    ground (airborne gate → 0), or spinning past 2π (clamped). The cap is set
+    ABOVE the natural flip rate (~12–16 rad/s) so it only forfeits absurd
+    whips, never the physically-necessary rotation.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    _, max_accum, paid = _backflip_state(env)
+    new_paid = torch.clamp(max_accum, max=target_angle)
+    delta = torch.clamp(new_paid - torch.clamp(paid, max=target_angle), min=0.0)
+    delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
+    env._backflip_paid = torch.maximum(paid, new_paid)
+    return delta / (env.step_dt * target_angle)
+
+
+def backflip_landing_composite(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_std: float,
+    upright_std: float,
+    pose_std: float,
+    joint_indices: list,
+    gate_lo: float = math.radians(300.0),
+    gate_hi: float = math.radians(355.0),
+    target_overrides: Optional[dict] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """standing_composite_score × completion gate — the dominant attractor.
+
+    Once the flip is (nearly) complete AND the robot has been airborne, every
+    step spent standing at HOME pose pays — finishing on the feet and staying
+    there dominates every partial outcome. Zero before gate_lo of rotation, so
+    the standing spawn cannot farm it by doing nothing.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    score = standing_composite_score(
+        env,
+        target_height=target_height,
+        height_std=height_std,
+        upright_std=upright_std,
+        pose_std=pose_std,
+        joint_indices=joint_indices,
+        target_overrides=target_overrides,
+        asset_cfg=asset_cfg,
+    )
+    return score * _backflip_completion_gate(env, gate_lo, gate_hi, require_airborne=True)
+
+
+def backflip_upright_after_flip(
+    env: ManagerBasedRlEnv,
+    gate_lo: float = math.radians(300.0),
+    gate_hi: float = math.radians(355.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Linear cos(tilt) × completion gate — bootstrap pull toward vertical.
+
+    Gradient from ANY orientation (the composite is near-zero far from the
+    goal), but only after the flip: before gate_lo it is exactly zero, so it
+    cannot oppose the rotation the way an always-on upright term would.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    quat = asset.data.root_link_quat_w
+    upright = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    return torch.clamp(upright, min=0.0) * _backflip_completion_gate(
+        env, gate_lo, gate_hi, require_airborne=True
+    )
+
+
+def backflip_height_after_flip(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    std: float = 0.04,
+    gate_lo: float = math.radians(300.0),
+    gate_hi: float = math.radians(355.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Broad height Gaussian × completion gate — pull up to standing height."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    g = torch.exp(-((z - target_height) / std) ** 2)
+    return g * _backflip_completion_gate(env, gate_lo, gate_hi, require_airborne=True)
+
+
+def backflip_landing_sharp(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_std: float = 0.015,
+    upright_std: float = 0.3,
+    gate_lo: float = math.radians(300.0),
+    gate_hi: float = math.radians(355.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Tight-std upright × height Gaussians × completion gate — the last mile.
+
+    The broad landing composite saturates near a slightly-crouched / leaned
+    landing basin; this sharp layer adds the 10× differential across the final
+    straighten so the policy finishes tall instead of parking at the touchdown
+    pose (the standup/roulade two-layer lesson).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    quat = asset.data.root_link_quat_w
+    tilt_sq = 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    upright_g = torch.exp(-tilt_sq / (upright_std * upright_std))
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    height_g = torch.exp(-((z - target_height) / height_std) ** 2)
+    gate = _backflip_completion_gate(env, gate_lo, gate_hi, require_airborne=True)
+    return upright_g * height_g * gate
+
+
+def backflip_stand_tax(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    gate_lo: float = math.radians(300.0),
+    gate_hi: float = math.radians(355.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """SELF-NEGATING height L1 below target, active only after flip completion.
+
+    Returns −max(0, target − z) × completion_gate — use a POSITIVE weight
+    (penalty sign convention). Makes "land then crumple in a heap" net
+    NEGATIVE (the standup static-sit lesson: a comfortable basin must cost),
+    while the gate keeps the flip itself untaxed and the airborne latch keeps a
+    no-jump episode from being punished into weird avoidance behaviors.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    shortfall = torch.clamp(target_height - z, min=0.0)
+    return -shortfall * _backflip_completion_gate(env, gate_lo, gate_hi, require_airborne=True)
+
+
+def backflip_overspeed_penalty(
+    env: ManagerBasedRlEnv,
+    omega_max: float = 22.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """max(0, |ω_y| − omega_max)² — quadratic tax on absurd whip-speed pitch.
+
+    Positive quantity; use a negative weight. The threshold sits WELL above the
+    natural flip rate (~12–16 rad/s) so a clean backflip never touches it; it
+    only prices genuinely violent over-spin that the paid-rate cap alone leaves
+    merely not-better.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    omega_y = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 1], nan=0.0)
+    excess = torch.clamp(omega_y.abs() - omega_max, min=0.0)
+    return excess.pow(2)
+
+
+def backflip_flatness_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """(lateral-axis world-z)² — dense gradient toward a sagittal flip.
+
+    Positive quantity; use a negative weight. Zero through an arbitrarily deep
+    CLEAN backward flip (pure pitch keeps the lateral axis horizontal), up to 1
+    when tipped onto a shoulder (a cartwheel). Backs the accumulator's flatness
+    gate with a per-step steering gradient.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.nan_to_num(_lateral_axis_z(asset.data.root_link_quat_w), nan=0.0).pow(2)
+
+
+def backflip_sagittal_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Rotation out of the sagittal plane: body-frame ω_x² + ω_z² (positive;
+    use a negative weight). ω_y is the flip axis and stays free."""
+    asset: Entity = env.scene[asset_cfg.name]
+    omega_b = asset.data.root_link_ang_vel_b
+    return torch.nan_to_num(omega_b[:, 0].pow(2) + omega_b[:, 2].pow(2), nan=0.0)
+
+
+def backflip_lateral_velocity_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Body-frame lateral (y) linear velocity² — keeps the flip straight."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
