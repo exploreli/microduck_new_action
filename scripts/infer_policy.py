@@ -951,10 +951,26 @@ def main():
                         help="Soften foot contact: solref time constant (s) for the foot geoms "
                              "(default sim ~0.02 = stiff/rigid). Larger = softer, to emulate the "
                              "compliant PU sole. e.g. --foot-solref 0.04")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run without GUI (offscreen rendering). Requires --output-video.")
+    parser.add_argument("--output-video", type=str, default=None,
+                        help="Path to save the rendered video (e.g. logs/backflip_demo.mp4). Required with --headless.")
+    parser.add_argument("--duration", type=float, default=10.0,
+                        help="Duration of the headless simulation in seconds (default: 10.0)")
+    parser.add_argument("--video-height", type=int, default=480,
+                        help="Video height in pixels (default: 480)")
+    parser.add_argument("--video-width", type=int, default=640,
+                        help="Video width in pixels (default: 640)")
+    parser.add_argument("--video-fps", type=int, default=10,
+                        help="Video frames per second (default: 10, lower than control freq to speed up rendering)")
+    parser.add_argument("--render-every", type=int, default=5,
+                        help="Render every N control steps (default: 5, i.e. 10 Hz rendering at 50 Hz control)")
     args = parser.parse_args()
 
     if not args.walking and not args.standing and not args.sitstand:
         parser.error("At least one of --walking, --standing or --sitstand must be provided")
+    if args.headless and not args.output_video:
+        parser.error("--headless requires --output-video to save the rendered video")
     if args.sitstand and not args.new_cmd_obs:
         parser.error("--sitstand policies use the unified 13D command obs (61D); add --new-cmd-obs")
     if (args.kick_left or args.kick_right or args.roulade or args.backflip) and not args.new_cmd_obs:
@@ -1366,6 +1382,66 @@ def main():
     print("  A / E:            head_roll ±step")
     print("  SPACE:            reset head offset to zero")
 
+    # Headless mode: offscreen rendering
+    if args.headless:
+        print(f"\n[HEADLESS] Starting offscreen rendering for {args.duration:.1f} seconds...")
+        print(f"[HEADLESS] Video resolution: {args.video_width}x{args.video_height} @ {args.video_fps} fps")
+        print(f"[HEADLESS] Render every {args.render_every} control steps ({50/args.render_every:.1f} Hz rendering)")
+        print(f"[HEADLESS] Output: {args.output_video}")
+        
+        renderer = mujoco.Renderer(model, height=args.video_height, width=args.video_width)
+        frames = []
+        start_time = time.time()
+        control_step_count = 0
+        
+        try:
+            # Headless mode: run as fast as possible, no real-time constraint
+            while control_step_count < int(args.duration * 50):  # 50 Hz control
+                action = policy.infer()
+                policy.apply_action(action)
+                control_step_count += 1
+                
+                # Step physics
+                for _ in range(decimation):
+                    if bam_ctrl is not None:
+                        bam_ctrl.update()
+                    mujoco.mj_step(model, data)
+                
+                # Render frame (only every N steps)
+                if control_step_count % args.render_every == 0:
+                    renderer.update_scene(data)
+                    img = renderer.render()
+                    frames.append(img)
+                    
+                    # Progress indicator
+                    if len(frames) % 10 == 0:
+                        elapsed = time.time() - start_time
+                        sim_time = control_step_count / 50.0
+                        print(f"  [{elapsed:.1f}s real / {sim_time:.1f}s sim] frame {len(frames)}")
+        
+        except KeyboardInterrupt:
+            print("\n[HEADLESS] KeyboardInterrupt received, saving video...")
+        
+        # Save video
+        if frames:
+            print(f"\n[HEADLESS] Saving {len(frames)} frames to {args.output_video}...")
+            try:
+                import imageio
+                imageio.mimsave(args.output_video, frames, fps=args.video_fps)
+                print(f"[HEADLESS] ✅ Video saved successfully: {args.output_video}")
+                print(f"[HEADLESS] Duration: {len(frames)/args.video_fps:.2f}s, Frames: {len(frames)}")
+                print(f"[HEADLESS] Sim time: {control_step_count/50.0:.2f}s, Control steps: {control_step_count}")
+            except ImportError:
+                print("[HEADLESS] ❌ imageio not installed. Saving frames as .npy instead...")
+                np.save(args.output_video.replace('.mp4', '_frames.npy'), np.array(frames))
+                print(f"[HEADLESS] Frames saved to {args.output_video.replace('.mp4', '_frames.npy')}")
+        else:
+            print("[HEADLESS] ⚠️ No frames rendered, video not saved.")
+        
+        renderer.close()
+        return
+    
+    # Interactive mode: MuJoCo viewer
     with TerminalInput() as term, \
          mujoco.viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False) as viewer:
         viewer.sync()
